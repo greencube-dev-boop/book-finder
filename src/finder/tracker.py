@@ -7,6 +7,7 @@ retry wrapper.
 """
 
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,10 +42,16 @@ def utcnow() -> str:
 
 
 class DownloadTracker:
+    """Thread-safe: download workers share one tracker. All DB operations run
+    under a re-entrant lock (SQLite connection + Drive FUSE are not
+    thread-safe); statements still go through the locked-retry wrapper."""
+
     def __init__(self, db_path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path), timeout=60.0)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.db_path), timeout=60.0,
+                                    check_same_thread=False)
         self.conn.execute("PRAGMA busy_timeout = 60000")
         self._retry(lambda: self.conn.executescript(SCHEMA))
         self.conn.commit()
@@ -52,11 +59,13 @@ class DownloadTracker:
     # ------------------------------------------------------------------ core
 
     def _retry(self, fn, attempts: int = 6):
-        """Run a DB operation, retrying on 'database is locked' (Drive FUSE)."""
+        """Run a DB operation under the lock, retrying on 'database is
+        locked' (Drive FUSE)."""
         delay = 1.0
         for i in range(attempts):
             try:
-                return fn()
+                with self._lock:
+                    return fn()
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc) and "busy" not in str(exc):
                     raise

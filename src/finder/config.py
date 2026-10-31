@@ -18,6 +18,7 @@ MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB — safety cap per file
 
 DOWNLOAD_RETRIES = 3        # attempts per file (network errors only)
 DOWNLOAD_CHUNK = 256 * 1024
+DOWNLOAD_WORKERS = 3        # parallel download threads (searches always run in parallel)
 
 # URLs that failed this many times are skipped on reruns (stored in `failures`).
 MAX_FAILURE_ATTEMPTS = 3

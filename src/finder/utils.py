@@ -3,6 +3,7 @@
 import logging
 import re
 import sys
+import threading
 import time
 import unicodedata
 
@@ -21,17 +22,23 @@ def setup_logging(level=logging.INFO):
 
 
 class RateLimiter:
-    """Remembers the last call time per key and enforces a minimum spacing."""
+    """Thread-safe per-key spacing: waits so calls to the same key are at
+    least `delay` apart (holding the key's lock while sleeping, so parallel
+    workers stay polite to each provider)."""
 
     def __init__(self):
         self._last = {}
+        self._locks = {}
+        self._guard = threading.Lock()
 
     def wait(self, key: str, delay: float):
-        now = time.monotonic()
-        gap = now - self._last.get(key, 0.0)
-        if gap < delay:
-            time.sleep(delay - gap)
-        self._last[key] = time.monotonic()
+        with self._guard:
+            key_lock = self._locks.setdefault(key, threading.Lock())
+        with key_lock:
+            gap = time.monotonic() - self._last.get(key, 0.0)
+            if gap < delay:
+                time.sleep(delay - gap)
+            self._last[key] = time.monotonic()
 
 
 RATE = RateLimiter()

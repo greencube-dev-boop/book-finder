@@ -1,12 +1,22 @@
-"""Pipeline: search sources -> dedupe -> download -> track -> report.
+"""Pipeline: parallel search + live download workers -> track -> report.
+
+A search/download CYCLE instead of two sequential phases:
+
+  * every (tag, source) pair is searched in its own thread;
+  * the moment a source returns records they are pushed into a shared queue;
+  * a pool of download workers pulls from that queue and starts saving
+    immediately — downloading overlaps the remaining searching.
 
 This is the single entry point the Colab notebook calls.
 """
 
+import concurrent.futures
 import json
+import queue
+import threading
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import requests
@@ -18,6 +28,20 @@ from .sources import REGISTRY
 from .tracker import DownloadTracker
 from .utils import RATE, log, setup_logging, slugify
 
+_STOP = object()  # queue sentinel: download workers exit when they see this
+
+_sessions = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """One requests.Session per thread (Session is not thread-safe)."""
+    session = getattr(_sessions, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers["User-Agent"] = C.USER_AGENT
+        _sessions.session = session
+    return session
+
 
 @dataclass
 class RunConfig:
@@ -25,9 +49,14 @@ class RunConfig:
     media: str = "papers"          # "papers" | "books" | "both"
     max_downloads: int = 100       # how many files to try downloading this run
     sources: str = "all"           # "all" | "papers" | "books" | comma-separated names
+    workers: int = C.DOWNLOAD_WORKERS  # parallel download threads (1-8)
     min_size_bytes: int = C.MIN_FILE_BYTES
     max_size_bytes: int = C.MAX_FILE_BYTES
     data_dir: str = ""             # override the OCR Engine root (for local tests)
+
+    def __post_init__(self):
+        self.tags = [t for t in (self.tags or []) if t and str(t).strip()]
+        self.workers = max(1, min(int(self.workers or 1), 8))
 
 
 def resolve_sources(sources: str, media: str) -> list:
@@ -44,26 +73,9 @@ def resolve_sources(sources: str, media: str) -> list:
     return names
 
 
-def _interleave(groups: dict) -> list:
-    """Round-robin merge {(tag, source): [records]} so every source/tag gets
-    a fair share of the download budget."""
-    queues = [list(v) for v in groups.values() if v]
-    out = []
-    while queues:
-        remaining = []
-        for q in queues:
-            if q:
-                out.append(q.pop(0))
-                if q:
-                    remaining.append(q)
-        queues = remaining
-    return out
-
-
 def run(cfg: RunConfig) -> dict:
     setup_logging()
     t0 = time.time()
-    cfg.tags = [t for t in (cfg.tags or []) if t and str(t).strip()]
     if not cfg.tags:
         raise ValueError("RunConfig.tags is empty — nothing to search for.")
 
@@ -72,91 +84,140 @@ def run(cfg: RunConfig) -> dict:
         paths[key].mkdir(parents=True, exist_ok=True)
 
     tracker = DownloadTracker(paths["db"])
-    session = requests.Session()
-    session.headers["User-Agent"] = C.USER_AGENT
-
     src_names = resolve_sources(cfg.sources, cfg.media)
     per_source_limit = max(50, min(cfg.max_downloads * 2, 300))
 
-    # 1) search every source for every tag ---------------------------------
-    groups = {}
-    source_errors = []
-    found_raw = 0
-    log.info("Searching %d source(s) for tags: %s", len(src_names), ", ".join(cfg.tags))
-    for tag in cfg.tags:
-        for name in src_names:
-            source = REGISTRY[name]()
-            try:
-                recs = source.search(tag, per_source_limit, session)
-            except Exception as exc:  # one failing source must not kill the run
-                source_errors.append(f"{name}/{tag}: {type(exc).__name__}: {exc}"[:200])
-                log.warning("source %s failed on tag %r: %s", name, tag, exc)
-                continue
-            log.info("  %-16s %-30r -> %d records",
-                     C.SOURCE_LABEL.get(name, name), tag, len(recs))
-            found_raw += len(recs)
-            for r in recs:
-                r.tag = tag
-            groups.setdefault((tag, name), []).extend(recs)
-
-    # 2) dedupe by URL -------------------------------------------------------
-    seen_urls, unique = set(), []
-    for rec in _interleave(groups):
-        if rec.url in seen_urls:
-            continue
-        seen_urls.add(rec.url)
-        unique.append(rec)
-
-    # 3) skip URLs already saved / known to fail permanently ------------------
-    already_tracked = sum(1 for r in unique if tracker.has_url(r.url))
-    candidates = [r for r in unique if not tracker.has_url(r.url)]
-    kept = []
-    for rec in candidates:
-        if tracker.failure_attempts(rec.url) >= C.MAX_FAILURE_ATTEMPTS:
-            continue
-        kept.append(rec)
-    batch = kept[: cfg.max_downloads]
-
-    log.info("Found %d records (%d unique, %d already tracked, %d blocked as "
-             "previously failed) -> downloading %d",
-             found_raw, len(unique), already_tracked, len(candidates) - len(kept),
-             len(batch))
-
-    # 4) download --------------------------------------------------------------
+    # ---------------------------------------------------------- shared state
+    record_q = queue.Queue(maxsize=max(cfg.max_downloads * 2, 100))
+    lock = threading.Lock()
+    seen_urls = set()
     counts = Counter()
     by_source = defaultdict(Counter)
     failures = []
+    source_errors = []
+    stats = {"found": 0, "enqueued": 0, "already_tracked": 0,
+             "blocked": 0, "attempted": 0, "not_attempted": 0}
+    budget_left = cfg.max_downloads
 
-    with tqdm(total=len(batch), unit="file", desc="Downloading") as bar:
-        for rec in batch:
-            subdir = paths["raw"] / rec.media / slugify(rec.tag)
-            RATE.wait(rec.source, C.DOWNLOAD_DELAY.get(rec.source, 1.0))
-            result = download(rec, subdir, tracker, session,
-                              cfg.min_size_bytes, cfg.max_size_bytes)
+    bar = tqdm(total=0, unit="file", desc="Downloading")
+
+    # ------------------------------------------------------------- consumers
+    def consume(rec):
+        """Dedup-check, reserve budget, download and track one record."""
+        nonlocal budget_left
+        with lock:
+            if budget_left <= 0:
+                stats["not_attempted"] += 1
+                return
+        if tracker.has_url(rec.url):
+            with lock:
+                stats["already_tracked"] += 1
+            return
+        if tracker.failure_attempts(rec.url) >= C.MAX_FAILURE_ATTEMPTS:
+            with lock:
+                stats["blocked"] += 1
+            return
+        with lock:  # reserve one download slot
+            if budget_left <= 0:
+                stats["not_attempted"] += 1
+                return
+            budget_left -= 1
+            stats["attempted"] += 1
+
+        subdir = paths["raw"] / rec.media / slugify(rec.tag)
+        RATE.wait(rec.source, C.DOWNLOAD_DELAY.get(rec.source, 1.0))
+        result = download(rec, subdir, tracker, _get_session(),
+                          cfg.min_size_bytes, cfg.max_size_bytes)
+        with lock:
             counts[result.status] += 1
             by_source[rec.source][result.status] += 1
             if result.status == "failed":
                 failures.append({"source": rec.source, "title": rec.title[:80],
                                  "url": rec.url, "error": result.error})
-                tracker.record_failure(url=rec.url, source=rec.source,
-                                       error=result.error)
-            bar.update(1)
-            bar.set_postfix(downloaded=counts["downloaded"],
-                            duplicate=counts["duplicate"],
-                            failed=counts["failed"])
+        if result.status == "failed":
+            tracker.record_failure(url=rec.url, source=rec.source,
+                                   error=result.error)
+        bar.set_postfix(downloaded=counts["downloaded"],
+                        duplicate=counts["duplicate"],
+                        failed=counts["failed"])
 
-    # 5) summary + report -------------------------------------------------------
+    def worker():
+        while True:
+            rec = record_q.get()
+            try:
+                if rec is _STOP:
+                    return
+                try:
+                    consume(rec)
+                except Exception as exc:  # one bad record must not kill a worker
+                    log.warning("worker error on %r: %s",
+                                getattr(rec, "url", "?"), exc)
+                bar.update(1)
+            finally:
+                record_q.task_done()
+
+    # ------------------------------------------------------------- producers
+    def produce(tag, name):
+        source = REGISTRY[name]()
+        try:
+            recs = source.search(tag, per_source_limit, _get_session())
+        except Exception as exc:  # one failing source must not kill the run
+            with lock:
+                source_errors.append(f"{name}/{tag}: {type(exc).__name__}: {exc}"[:200])
+            log.warning("source %s failed on tag %r: %s", name, tag, exc)
+            return
+        log.info("  %-16s %-30r -> %d records",
+                 C.SOURCE_LABEL.get(name, name), tag, len(recs))
+        fresh = []
+        with lock:
+            stats["found"] += len(recs)
+            for r in recs:
+                r.tag = tag
+                if r.url not in seen_urls:
+                    seen_urls.add(r.url)
+                    fresh.append(r)
+            stats["enqueued"] += len(fresh)
+        for r in fresh:  # blocks if workers fall behind (backpressure)
+            record_q.put(r)
+        with bar.get_lock():  # downloads can now start on these records
+            bar.total += len(fresh)
+            bar.refresh()
+
+    workers = [threading.Thread(target=worker, daemon=True, name=f"dl-{i}")
+               for i in range(cfg.workers)]
+    for w in workers:
+        w.start()
+
+    jobs = [(tag, name) for tag in cfg.tags for name in src_names]
+    log.info("Searching %d source(s) x %d tag(s) in parallel with %d download "
+             "worker(s): %s", len(src_names), len(cfg.tags), cfg.workers,
+             ", ".join(cfg.tags))
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(jobs), 12), thread_name_prefix="search") as pool:
+        futures = [pool.submit(produce, tag, name) for tag, name in jobs]
+        concurrent.futures.wait(futures)  # exceptions handled inside produce
+
+    for _ in workers:  # all searches done: tell workers to drain and exit
+        record_q.put(_STOP)
+    for w in workers:
+        w.join()
+    bar.close()
+
+    # ---------------------------------------------------------------- report
     elapsed = round(time.time() - t0, 1)
     summary = {
         "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tags": cfg.tags,
         "media": cfg.media,
         "sources": src_names,
+        "workers": cfg.workers,
         "max_downloads": cfg.max_downloads,
-        "found": found_raw,
-        "unique_urls": len(unique),
-        "already_tracked": already_tracked,
-        "attempted": len(batch),
+        "found": stats["found"],
+        "unique_urls": stats["enqueued"],
+        "already_tracked": stats["already_tracked"],
+        "skipped_permanently_failed": stats["blocked"],
+        "attempted": stats["attempted"],
+        "not_attempted": stats["not_attempted"],
         "downloaded": counts["downloaded"],
         "duplicates": counts["duplicate"],
         "failed": counts["failed"],
@@ -187,12 +248,16 @@ def _print_report(summary: dict, report_path):
     p("=" * 64)
     p(f" Tags searched      : {', '.join(summary['tags'])}")
     p(f" Media / sources    : {summary['media']} / {', '.join(summary['sources'])}")
+    p(f" Parallelism        : search x{len(summary['sources']) * max(len(summary['tags']), 1)}"
+      f" threads, downloads x{summary['workers']} workers")
     p(f" Records found      : {summary['found']}  (unique URLs: {summary['unique_urls']})")
     p(f" Already tracked    : {summary['already_tracked']} (downloaded in earlier runs)")
     p("-" * 64)
     p(f" DOWNLOADED         : {summary['downloaded']}")
     p(f" DUPLICATES skipped : {summary['duplicates']} (same SHA-256 already saved)")
     p(f" FAILED             : {summary['failed']}")
+    if summary.get("not_attempted"):
+        p(f" Not attempted      : {summary['not_attempted']} (download budget reached)")
     p("-" * 64)
     for src, cnt in summary["by_source"].items():
         label = C.SOURCE_LABEL.get(src, src)

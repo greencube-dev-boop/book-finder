@@ -17,6 +17,15 @@ file by **SHA-256** so nothing is ever stored twice.
 5. Run **Cell 3** — it prints *found / downloaded / duplicates / failed* and saves
    everything to `MyDrive/OCR Engine/raw/`.
 
+### Fast by default: search + download cycle
+
+Searches run **in parallel** (one thread per tag x source) and **downloads start
+the moment a search returns results** — a pool of worker threads (Cell 2's
+`WORKERS`, default 3) pulls from a shared queue while the remaining sources are
+still being searched. No more waiting for all searches to finish before any
+download starts. Per-source politeness delays and API rate limits are still
+respected (thread-safe rate limiter).
+
 ### Why the notebook never needs re-uploading
 
 All logic lives in this repo. Cell 1 runs `git clone` (or `git pull`) **every run**, so
