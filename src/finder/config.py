@@ -78,3 +78,12 @@ def paths_for(data_root) -> dict:
         "reports": root / "config" / "reports",
         "db": root / "config" / "download_tracker.db",
     }
+
+
+def staging_dir_for(data_root) -> Path:
+    """Where downloads are staged (fast local disk) before being moved to
+    Drive: /content in Colab, a hidden folder next to the data root locally."""
+    root_str = str(data_root).replace("\\", "/")
+    if root_str.startswith("/content/"):
+        return Path("/content/book_finder_staging")
+    return Path(data_root) / ".staging"

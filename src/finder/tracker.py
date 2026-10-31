@@ -42,9 +42,13 @@ def utcnow() -> str:
 
 
 class DownloadTracker:
-    """Thread-safe: download workers share one tracker. All DB operations run
-    under a re-entrant lock (SQLite connection + Drive FUSE are not
-    thread-safe); statements still go through the locked-retry wrapper."""
+    """Thread-safe tracker with an in-memory cache ("the array").
+
+    Per the pipeline flow: the whole DB is loaded into memory once per run
+    (all SHA-256 hashes, URLs and failure counters), so every dedup check is
+    a RAM lookup — the Drive DB is only touched when a NEW file is recorded.
+    All DB operations run under a re-entrant lock (SQLite connection + Drive
+    FUSE are not thread-safe) with locked-retry on 'database is locked'."""
 
     def __init__(self, db_path):
         self.db_path = Path(db_path)
@@ -55,6 +59,10 @@ class DownloadTracker:
         self.conn.execute("PRAGMA busy_timeout = 60000")
         self._retry(lambda: self.conn.executescript(SCHEMA))
         self.conn.commit()
+        # in-memory arrays, filled by load_cache()
+        self._shas = None          # set[str]
+        self._urls = None          # set[str]
+        self._fail_attempts = None # dict[str, int]
 
     # ------------------------------------------------------------------ core
 
@@ -74,21 +82,68 @@ class DownloadTracker:
                 time.sleep(delay)
                 delay *= 1.7
 
+    # ------------------------------------------------- in-memory array cache
+
+    def load_cache(self):
+        """Load the DB into memory: (n_hashes, n_urls, n_failed_urls)."""
+        cur = self._retry(lambda: self.conn.execute("SELECT sha256 FROM files"))
+        self._shas = {r[0] for r in cur.fetchall()}
+        cur = self._retry(lambda: self.conn.execute("SELECT url FROM files"))
+        self._urls = {r[0] for r in cur.fetchall()}
+        cur = self._retry(
+            lambda: self.conn.execute("SELECT url, attempts FROM failures"))
+        self._fail_attempts = dict(cur.fetchall())
+        return len(self._shas), len(self._urls), len(self._fail_attempts)
+
+    def knows_sha(self, sha256: str) -> bool:
+        """Is this content hash already saved? RAM lookup once cache loaded."""
+        if self._shas is not None:
+            return sha256 in self._shas
+        return self.has_sha_db(sha256)
+
+    def knows_url(self, url: str) -> bool:
+        if self._urls is not None:
+            return url in self._urls
+        return self.has_url_db(url)
+
+    def remember_sha(self, sha256: str):
+        """Add a hash to the in-memory array (before the DB sync + move)."""
+        if self._shas is not None:
+            self._shas.add(sha256)
+
+    def forget(self, sha256: str, url: str):
+        """Roll back a record (the file move to Drive failed): drop the hash
+        and URL from the array and delete the DB row so content can be
+        retried on a later run."""
+        if self._shas is not None:
+            self._shas.discard(sha256)
+        if self._urls is not None:
+            self._urls.discard(url)
+
+        def _del():
+            self.conn.execute("DELETE FROM files WHERE sha256 = ?", (sha256,))
+            self.conn.commit()
+
+        self._retry(_del)
+
     # ---------------------------------------------------------------- queries
 
-    def has_sha(self, sha256: str) -> bool:
+    def has_sha_db(self, sha256: str) -> bool:
         cur = self._retry(
             lambda: self.conn.execute("SELECT 1 FROM files WHERE sha256 = ?", (sha256,))
         )
         return cur.fetchone() is not None
 
-    def has_url(self, url: str) -> bool:
+    def has_url_db(self, url: str) -> bool:
         cur = self._retry(
             lambda: self.conn.execute("SELECT 1 FROM files WHERE url = ?", (url,))
         )
         return cur.fetchone() is not None
 
     def failure_attempts(self, url: str) -> int:
+        """Cached once load_cache() ran; DB lookup before that."""
+        if self._fail_attempts is not None:
+            return self._fail_attempts.get(url, 0)
         cur = self._retry(
             lambda: self.conn.execute(
                 "SELECT attempts FROM failures WHERE url = ?", (url,)
@@ -123,7 +178,10 @@ class DownloadTracker:
 
     def record_file(self, *, sha256, url, filepath, source, media, tag, title,
                     ext, size_bytes) -> bool:
-        """Insert a downloaded file. Returns False if sha/url was already known."""
+        """Sync a new file to the DB. Returns False if sha/url was already
+        known (another worker saved the same content first). Also updates
+        the in-memory arrays."""
+
         def _insert():
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO files "
@@ -135,7 +193,12 @@ class DownloadTracker:
             self.conn.commit()
             return cur.rowcount > 0
 
-        return self._retry(_insert)
+        inserted = self._retry(_insert)
+        if self._shas is not None:
+            self._shas.add(sha256)
+        if inserted and self._urls is not None:
+            self._urls.add(url)
+        return inserted
 
     def record_failure(self, *, url, source, error):
         """Register (or bump the attempt counter of) a failed URL."""
@@ -152,6 +215,8 @@ class DownloadTracker:
             self.conn.commit()
 
         self._retry(_upsert)
+        if self._fail_attempts is not None:
+            self._fail_attempts[url] = self._fail_attempts.get(url, 0) + 1
 
     def close(self):
         try:

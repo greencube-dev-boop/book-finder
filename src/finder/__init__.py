@@ -3,4 +3,4 @@
 Entry point is :func:`finder.pipeline.run`. The Colab notebook only calls that.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

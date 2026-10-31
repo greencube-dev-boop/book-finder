@@ -83,7 +83,25 @@ def run(cfg: RunConfig) -> dict:
     for key in ("raw", "config", "reports"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
+    # staging folder (fast Colab disk) — downloads land here first, get
+    # hashed, then move to Drive only if their SHA-256 is new
+    staging = C.staging_dir_for(paths["root"])
+    staging.mkdir(parents=True, exist_ok=True)
+    stale = 0
+    for f in staging.iterdir():
+        if f.is_file() and f.name.startswith(".tmp_"):
+            try:
+                f.unlink()
+                stale += 1
+            except OSError:
+                pass
+    if stale:
+        log.info("Cleared %d stale staged file(s) from %s", stale, staging)
+
     tracker = DownloadTracker(paths["db"])
+    n_shas, n_urls, n_failed = tracker.load_cache()  # the in-memory array
+    log.info("Tracker array loaded from DB: %d hashes, %d URLs, %d failed URLs",
+             n_shas, n_urls, n_failed)
     src_names = resolve_sources(cfg.sources, cfg.media)
     per_source_limit = max(50, min(cfg.max_downloads * 2, 300))
 
@@ -109,7 +127,7 @@ def run(cfg: RunConfig) -> dict:
             if budget_left <= 0:
                 stats["not_attempted"] += 1
                 return
-        if tracker.has_url(rec.url):
+        if tracker.knows_url(rec.url):
             with lock:
                 stats["already_tracked"] += 1
             return
@@ -126,7 +144,7 @@ def run(cfg: RunConfig) -> dict:
 
         subdir = paths["raw"] / rec.media / slugify(rec.tag)
         RATE.wait(rec.source, C.DOWNLOAD_DELAY.get(rec.source, 1.0))
-        result = download(rec, subdir, tracker, _get_session(),
+        result = download(rec, subdir, staging, tracker, _get_session(),
                           cfg.min_size_bytes, cfg.max_size_bytes)
         with lock:
             counts[result.status] += 1
@@ -226,6 +244,7 @@ def run(cfg: RunConfig) -> dict:
         "failures_sample": failures[:15],
         "db_totals": tracker.stats(),
         "raw_dir": str(paths["raw"]),
+        "staging_dir": str(staging),
         "tracker_db": str(paths["db"]),
         "elapsed_sec": elapsed,
     }
@@ -265,6 +284,7 @@ def _print_report(summary: dict, report_path):
           f" duplicate={cnt.get('duplicate', 0):<4} failed={cnt.get('failed', 0)}")
     p("-" * 64)
     p(f" Saved to           : {summary['raw_dir']}")
+    p(f" Staged in          : {summary['staging_dir']} (local, moved after SHA-256 check)")
     p(f" Tracker DB         : {summary['tracker_db']}")
     p(f"   unique files in DB : {summary['db_totals']['total_files']}")
     p(f" Full report        : {report_path}")

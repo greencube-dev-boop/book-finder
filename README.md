@@ -22,9 +22,21 @@ file by **SHA-256** so nothing is ever stored twice.
 Searches run **in parallel** (one thread per tag x source) and **downloads start
 the moment a search returns results** — a pool of worker threads (Cell 2's
 `WORKERS`, default 3) pulls from a shared queue while the remaining sources are
-still being searched. No more waiting for all searches to finish before any
-download starts. Per-source politeness delays and API rate limits are still
-respected (thread-safe rate limiter).
+still being searched. Per-source politeness delays and API rate limits are
+still respected (thread-safe rate limiter).
+
+### The download flow (staging + SHA-256 array)
+
+1. The tracker DB is loaded into memory once per run (all hashes, URLs and
+   failure counters) — every dedup check is a RAM lookup, the Drive DB is
+   only written for genuinely new files.
+2. Each file downloads into a **staging folder in the Colab environment**
+   (`/content/book_finder_staging`) and is hashed (SHA-256) while streaming.
+3. Hash already in the array? → the staged file is **deleted**, next file.
+4. New? → hash is added to the array, **synced to `download_tracker.db`** on
+   Drive, then the file is **moved** to `OCR Engine/raw/`. (If the move fails
+   the record is rolled back so it can be retried later.) Drive never sees
+   partial or duplicate files.
 
 ### Why the notebook never needs re-uploading
 

@@ -1,5 +1,13 @@
-"""Streaming downloader: computes the file's SHA-256 while saving it, then
-checks the tracker so identical content/URLs are never stored twice."""
+"""Downloader implementing the pipeline flow:
+
+  1. download into the STAGING folder (Colab env / local disk), hashing the
+     content (SHA-256) while it streams in;
+  2. check the hash against the in-memory array loaded from the tracker DB;
+     if already known -> delete the staged file, done (never saved twice);
+  3. if new -> remember the hash in the array, sync the DB on Drive, then
+     move the finished file to its Drive (raw) location. If that move fails
+     the record is rolled back so the content can be retried later.
+"""
 
 import hashlib
 import shutil
@@ -80,23 +88,24 @@ def _valid_magic(path: Path, ext: str) -> bool:
         return False
 
 
-def download(record, dest_dir: Path, tracker, session,
+def download(record, dest_dir: Path, staging_dir: Path, tracker, session,
              min_bytes: int, max_bytes: int) -> DownloadResult:
-    """Download one record into dest_dir with dedup + tracking.
+    """Download one record: stage -> hash -> dedup -> sync -> move to Drive.
 
     Returns a DownloadResult; never raises for per-file problems.
     """
     res = DownloadResult(status="failed", source=record.source, title=record.title,
                          url=record.url, tag=record.tag)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
     stem = sanitize_filename(f"{record.source}-{record.id}",
                              fallback=sanitize_filename(record.title, "download"))
-    tmp_path = dest_dir / f".tmp_{stem}.{record.ext}"
-    final_path = dest_dir / f"{stem}.{record.ext}"
+    tmp_path = staging_dir / f".tmp_{stem}.{record.ext}"    # Colab env (fast disk)
+    final_path = dest_dir / f"{stem}.{record.ext}"          # Drive raw folder
     res.filepath = str(final_path)
 
-    # --- fetch with retries (network errors only) -------------------------
+    # --- 1. download to staging, hashing while streaming -------------------
     sha = size = None
     for attempt in range(1, C.DOWNLOAD_RETRIES + 1):
         try:
@@ -114,7 +123,7 @@ def download(record, dest_dir: Path, tracker, session,
     if sha is None:
         return res  # retries exhausted
 
-    # --- sanity checks -----------------------------------------------------
+    # --- sanity checks ------------------------------------------------------
     if size < min_bytes:
         res.error = f"file too small ({size} B < {min_bytes} B min)"
         _cleanup(tmp_path)
@@ -124,28 +133,34 @@ def download(record, dest_dir: Path, tracker, session,
         _cleanup(tmp_path)
         return res
 
-    # --- dedup by content hash ----------------------------------------------
-    if tracker.has_sha(sha):
+    # --- 2. check the hash in the in-memory array ---------------------------
+    res.sha256 = sha
+    res.size_bytes = size
+    if tracker.knows_sha(sha):
         res.status = "duplicate"
-        res.sha256 = sha
-        res.size_bytes = size
-        _cleanup(tmp_path)
+        _cleanup(tmp_path)  # delete the staged file, proceed to the next
         return res
 
-    # --- finalize -----------------------------------------------------------
-    try:
-        shutil.move(str(tmp_path), str(final_path))
-    except OSError as exc:
-        res.error = f"could not save file: {exc}"
-        _cleanup(tmp_path)
-        return res
-
+    # --- 3. new content: remember -> sync DB -> move to Drive ---------------
+    tracker.remember_sha(sha)  # add to the in-memory array first
     inserted = tracker.record_file(
         sha256=sha, url=record.url, filepath=final_path, source=record.source,
         media=record.media, tag=record.tag, title=record.title, ext=record.ext,
         size_bytes=size,
     )
-    res.status = "downloaded" if inserted else "duplicate"
-    res.sha256 = sha
-    res.size_bytes = size
+    try:
+        shutil.move(str(tmp_path), str(final_path))  # Colab env -> Drive
+    except OSError as exc:
+        tracker.forget(sha, record.url)  # roll back array + DB row
+        res.error = f"could not move file to Drive: {exc}"
+        _cleanup(tmp_path)
+        return res
+
+    if not inserted:
+        # a parallel worker saved identical content first: drop our copy
+        res.status = "duplicate"
+        _cleanup(final_path)
+        return res
+
+    res.status = "downloaded"
     return res
