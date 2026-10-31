@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.smoke_data/
+.ipynb_checkpoints/
+.env
+.DS_Store
+Thumbs.db
+.zcode/  
