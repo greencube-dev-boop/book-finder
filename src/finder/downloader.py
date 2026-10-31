@@ -36,10 +36,40 @@ class DownloadResult:
     sha256: str = ""
     size_bytes: int = 0
     error: str = ""
+    invalid: bool = False  # content downloaded but failed validation (corrupt)
 
 
 # Magic bytes so we never store an HTML error page renamed to .pdf.
 MAGIC = {"pdf": b"%PDF-", "epub": b"PK\x03\x04"}
+
+
+def _validate_document(path: Path, ext: str):
+    """Content-integrity check: (ok, reason).
+
+    PDFs must parse and have >= 1 page (pypdf); EPUBs must be intact zips.
+    Returns (True, "") when no validator is available (dependency missing) so
+    downloads are never blocked by an optional import."""
+    if ext == "pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return True, "pypdf not installed - PDF validation skipped"
+        try:
+            if len(PdfReader(str(path)).pages) < 1:
+                return False, "PDF is unparseable or has 0 pages"
+            return True, ""
+        except Exception as exc:
+            return False, f"PDF is corrupt ({type(exc).__name__})"
+    if ext == "epub":
+        try:
+            import zipfile
+            with zipfile.ZipFile(str(path)) as zf:
+                if zf.testzip() is not None:
+                    return False, "EPUB zip contains a corrupt member"
+            return True, ""
+        except Exception as exc:
+            return False, f"EPUB is corrupt ({type(exc).__name__})"
+    return True, ""
 
 
 def _cleanup(path: Path):
@@ -89,8 +119,8 @@ def _valid_magic(path: Path, ext: str) -> bool:
 
 
 def download(record, dest_dir: Path, staging_dir: Path, tracker, session,
-             min_bytes: int, max_bytes: int) -> DownloadResult:
-    """Download one record: stage -> hash -> dedup -> sync -> move to Drive.
+             min_bytes: int, max_bytes: int, work_key: str = "") -> DownloadResult:
+    """Download one record: stage -> hash -> dedup -> validate -> sync -> move.
 
     Returns a DownloadResult; never raises for per-file problems.
     """
@@ -130,6 +160,13 @@ def download(record, dest_dir: Path, staging_dir: Path, tracker, session,
         return res
     if not _valid_magic(tmp_path, record.ext):
         res.error = f"content is not a valid {record.ext.upper()}"
+        res.invalid = True
+        _cleanup(tmp_path)
+        return res
+    ok, why = _validate_document(tmp_path, record.ext)
+    if not ok:
+        res.error = why
+        res.invalid = True  # deterministic corruption: caller marks the URL fully failed
         _cleanup(tmp_path)
         return res
 
@@ -148,10 +185,12 @@ def download(record, dest_dir: Path, staging_dir: Path, tracker, session,
         media=record.media, tag=record.tag, title=record.title, ext=record.ext,
         size_bytes=size,
     )
+    if work_key:
+        tracker.record_work(work_key, sha)
     try:
         shutil.move(str(tmp_path), str(final_path))  # Colab env -> Drive
     except OSError as exc:
-        tracker.forget(sha, record.url)  # roll back array + DB row
+        tracker.forget(sha, record.url, work_key)  # roll back arrays + DB rows
         res.error = f"could not move file to Drive: {exc}"
         _cleanup(tmp_path)
         return res

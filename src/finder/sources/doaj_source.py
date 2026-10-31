@@ -42,7 +42,7 @@ class DoajSource(Source):
                     continue
                 records.append(Record(
                     source=self.name, media=self.media, id=aid, title=title,
-                    url=url, ext="pdf",
+                    url=url, ext="pdf", doi=bj.get("doi") or "",
                 ))
                 if len(records) >= limit:
                     break

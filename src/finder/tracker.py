@@ -9,7 +9,7 @@ retry wrapper.
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS files (
     ext           TEXT,
     size_bytes    INTEGER,
     downloaded_at TEXT
+);
+CREATE TABLE IF NOT EXISTS works (
+    work_key TEXT PRIMARY KEY,
+    sha256   TEXT
 );
 CREATE TABLE IF NOT EXISTS failures (
     url          TEXT PRIMARY KEY,
@@ -62,7 +66,8 @@ class DownloadTracker:
         # in-memory arrays, filled by load_cache()
         self._shas = None          # set[str]
         self._urls = None          # set[str]
-        self._fail_attempts = None # dict[str, int]
+        self._works = None         # set[str] — work-level dedup keys
+        self._failures = None      # dict[str, (attempts, last_attempt_iso)]
 
     # ------------------------------------------------------------------ core
 
@@ -85,15 +90,17 @@ class DownloadTracker:
     # ------------------------------------------------- in-memory array cache
 
     def load_cache(self):
-        """Load the DB into memory: (n_hashes, n_urls, n_failed_urls)."""
+        """Load the DB into memory: (n_hashes, n_urls, n_works, n_failed_urls)."""
         cur = self._retry(lambda: self.conn.execute("SELECT sha256 FROM files"))
         self._shas = {r[0] for r in cur.fetchall()}
         cur = self._retry(lambda: self.conn.execute("SELECT url FROM files"))
         self._urls = {r[0] for r in cur.fetchall()}
-        cur = self._retry(
-            lambda: self.conn.execute("SELECT url, attempts FROM failures"))
-        self._fail_attempts = dict(cur.fetchall())
-        return len(self._shas), len(self._urls), len(self._fail_attempts)
+        cur = self._retry(lambda: self.conn.execute("SELECT work_key FROM works"))
+        self._works = {r[0] for r in cur.fetchall()}
+        cur = self._retry(lambda: self.conn.execute(
+            "SELECT url, attempts, last_attempt FROM failures"))
+        self._failures = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        return len(self._shas), len(self._urls), len(self._works), len(self._failures)
 
     def knows_sha(self, sha256: str) -> bool:
         """Is this content hash already saved? RAM lookup once cache loaded."""
@@ -111,17 +118,21 @@ class DownloadTracker:
         if self._shas is not None:
             self._shas.add(sha256)
 
-    def forget(self, sha256: str, url: str):
-        """Roll back a record (the file move to Drive failed): drop the hash
-        and URL from the array and delete the DB row so content can be
-        retried on a later run."""
+    def forget(self, sha256: str, url: str, work_key: str = ""):
+        """Roll back a record (the file move to Drive failed): drop the hash,
+        URL and work key from the arrays and delete the DB rows so the
+        content can be retried on a later run."""
         if self._shas is not None:
             self._shas.discard(sha256)
         if self._urls is not None:
             self._urls.discard(url)
+        if work_key and self._works is not None:
+            self._works.discard(work_key)
 
         def _del():
             self.conn.execute("DELETE FROM files WHERE sha256 = ?", (sha256,))
+            if work_key:
+                self.conn.execute("DELETE FROM works WHERE work_key = ?", (work_key,))
             self.conn.commit()
 
         self._retry(_del)
@@ -142,15 +153,67 @@ class DownloadTracker:
 
     def failure_attempts(self, url: str) -> int:
         """Cached once load_cache() ran; DB lookup before that."""
-        if self._fail_attempts is not None:
-            return self._fail_attempts.get(url, 0)
+        entry = self._failure_entry(url)
+        return entry[0] if entry else 0
+
+    def _failure_entry(self, url: str):
+        if self._failures is not None:
+            return self._failures.get(url)
         cur = self._retry(
             lambda: self.conn.execute(
-                "SELECT attempts FROM failures WHERE url = ?", (url,)
+                "SELECT attempts, last_attempt FROM failures WHERE url = ?",
+                (url,),
             )
         )
-        row = cur.fetchone()
-        return row[0] if row else 0
+        return cur.fetchone()
+
+    def should_skip_failure(self, url: str, max_attempts: int = 3,
+                            within_days: int = 30) -> bool:
+        """True only if the URL failed >= max_attempts times AND the last
+        failure is recent — older failures get another chance (self-healing
+        after provider outages)."""
+        entry = self._failure_entry(url)
+        if not entry:
+            return False
+        attempts, last = entry
+        if attempts < max_attempts:
+            return False
+        if not last:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(str(last))
+        except ValueError:
+            return True
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - last_dt) < timedelta(days=within_days)
+
+    # ------------------------------------------------------- work-level dedup
+
+    def knows_work(self, work_key: str) -> bool:
+        if self._works is not None:
+            return work_key in self._works
+        cur = self._retry(
+            lambda: self.conn.execute(
+                "SELECT 1 FROM works WHERE work_key = ?", (work_key,))
+        )
+        return cur.fetchone() is not None
+
+    def record_work(self, work_key: str, sha256: str) -> bool:
+        """Sync a work key to the DB. False if the work was already known."""
+
+        def _ins():
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO works (work_key, sha256) VALUES (?, ?)",
+                (work_key, sha256),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+        inserted = self._retry(_ins)
+        if self._works is not None:
+            self._works.add(work_key)
+        return inserted
 
     def stats(self) -> dict:
         cur = self._retry(
@@ -200,23 +263,27 @@ class DownloadTracker:
             self._urls.add(url)
         return inserted
 
-    def record_failure(self, *, url, source, error):
-        """Register (or bump the attempt counter of) a failed URL."""
+    def record_failure(self, *, url, source, error, bump_to=None):
+        """Register (or bump the attempt counter of) a failed URL.
+
+        bump_to: floor the attempt counter at this value — used for
+        deterministic content problems (corrupt files) that must not be
+        retried until the retry window expires."""
+
+        new_attempts = max(self.failure_attempts(url) + 1, int(bump_to or 0))
+        now = utcnow()
 
         def _upsert():
             self.conn.execute(
-                "INSERT INTO failures (url, source, error, attempts, last_attempt) "
-                "VALUES (?, ?, ?, 1, ?) "
-                "ON CONFLICT(url) DO UPDATE SET "
-                "    attempts = attempts + 1, error = excluded.error, "
-                "    source = excluded.source, last_attempt = excluded.last_attempt",
-                (url, source, str(error)[:500], utcnow()),
+                "INSERT OR REPLACE INTO failures "
+                "(url, source, error, attempts, last_attempt) VALUES (?, ?, ?, ?, ?)",
+                (url, source, str(error)[:500], new_attempts, now),
             )
             self.conn.commit()
 
         self._retry(_upsert)
-        if self._fail_attempts is not None:
-            self._fail_attempts[url] = self._fail_attempts.get(url, 0) + 1
+        if self._failures is not None:
+            self._failures[url] = (new_attempts, now)
 
     def close(self):
         try:

@@ -55,7 +55,7 @@ class SemanticScholarSource(Source):
                     continue
                 records.append(Record(
                     source=self.name, media=self.media, id=str(pid), title=title,
-                    url=url, ext="pdf",
+                    url=url, ext="pdf", doi=ids.get("DOI") or "",
                 ))
                 if len(records) >= limit:
                     break

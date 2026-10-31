@@ -20,8 +20,11 @@ DOWNLOAD_RETRIES = 3        # attempts per file (network errors only)
 DOWNLOAD_CHUNK = 256 * 1024
 DOWNLOAD_WORKERS = 3        # parallel download threads (searches always run in parallel)
 
-# URLs that failed this many times are skipped on reruns (stored in `failures`).
+# URLs that failed this many times are skipped on reruns (stored in `failures`)
+# — but only while the last failure is younger than FAILURE_RETRY_DAYS; older
+# failures get another chance (self-healing after provider outages).
 MAX_FAILURE_ATTEMPTS = 3
+FAILURE_RETRY_DAYS = 30
 
 # Politeness delays (seconds) between requests to each provider.
 SEARCH_DELAY = {

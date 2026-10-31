@@ -26,7 +26,7 @@ from . import config as C
 from .downloader import download
 from .sources import REGISTRY
 from .tracker import DownloadTracker
-from .utils import RATE, log, setup_logging, slugify
+from .utils import RATE, log, setup_logging, slugify, work_key
 
 _STOP = object()  # queue sentinel: download workers exit when they see this
 
@@ -99,9 +99,9 @@ def run(cfg: RunConfig) -> dict:
         log.info("Cleared %d stale staged file(s) from %s", stale, staging)
 
     tracker = DownloadTracker(paths["db"])
-    n_shas, n_urls, n_failed = tracker.load_cache()  # the in-memory array
-    log.info("Tracker array loaded from DB: %d hashes, %d URLs, %d failed URLs",
-             n_shas, n_urls, n_failed)
+    n_shas, n_urls, n_works, n_failed = tracker.load_cache()  # in-memory array
+    log.info("Tracker array loaded from DB: %d hashes, %d URLs, %d works, "
+             "%d failed URLs", n_shas, n_urls, n_works, n_failed)
     src_names = resolve_sources(cfg.sources, cfg.media)
     per_source_limit = max(50, min(cfg.max_downloads * 2, 300))
 
@@ -113,9 +113,19 @@ def run(cfg: RunConfig) -> dict:
     by_source = defaultdict(Counter)
     failures = []
     source_errors = []
-    stats = {"found": 0, "enqueued": 0, "already_tracked": 0,
-             "blocked": 0, "attempted": 0, "not_attempted": 0}
+    stats = {"found": 0, "enqueued": 0, "already_tracked": 0, "work_duplicates": 0,
+             "blocked": 0, "attempted": 0, "not_attempted": 0,
+             "deferred_for_fairness": 0}
     budget_left = cfg.max_downloads
+
+    # budget split: each selected source gets an equal share; records beyond a
+    # source's share are deferred (kept in memory) while searches run, and
+    # redistributed to unused shares once every search has finished.
+    share = max(1, -(-cfg.max_downloads // max(len(src_names), 1)))  # ceil div
+    caps = {name: share for name in src_names}
+    used_by_source = defaultdict(int)
+    overflow = defaultdict(list)
+    search_phase = {"on": True}
 
     bar = tqdm(total=0, unit="file", desc="Downloading")
 
@@ -131,21 +141,32 @@ def run(cfg: RunConfig) -> dict:
             with lock:
                 stats["already_tracked"] += 1
             return
-        if tracker.failure_attempts(rec.url) >= C.MAX_FAILURE_ATTEMPTS:
+        if rec.work_key and tracker.knows_work(rec.work_key):
+            with lock:  # same paper/book already saved via another source
+                stats["work_duplicates"] += 1
+            return
+        if tracker.should_skip_failure(rec.url, C.MAX_FAILURE_ATTEMPTS,
+                                       C.FAILURE_RETRY_DAYS):
             with lock:
                 stats["blocked"] += 1
             return
-        with lock:  # reserve one download slot
+        with lock:  # reserve one download slot (global budget + source share)
             if budget_left <= 0:
                 stats["not_attempted"] += 1
                 return
+            if search_phase["on"] and used_by_source[rec.source] >= caps.get(rec.source, 0):
+                overflow[rec.source].append(rec)  # deferred, not dropped
+                stats["deferred_for_fairness"] += 1
+                return
             budget_left -= 1
+            used_by_source[rec.source] += 1
             stats["attempted"] += 1
 
         subdir = paths["raw"] / rec.media / slugify(rec.tag)
         RATE.wait(rec.source, C.DOWNLOAD_DELAY.get(rec.source, 1.0))
         result = download(rec, subdir, staging, tracker, _get_session(),
-                          cfg.min_size_bytes, cfg.max_size_bytes)
+                          cfg.min_size_bytes, cfg.max_size_bytes,
+                          work_key=rec.work_key)
         with lock:
             counts[result.status] += 1
             by_source[rec.source][result.status] += 1
@@ -154,7 +175,8 @@ def run(cfg: RunConfig) -> dict:
                                  "url": rec.url, "error": result.error})
         if result.status == "failed":
             tracker.record_failure(url=rec.url, source=rec.source,
-                                   error=result.error)
+                                   error=result.error,
+                                   bump_to=C.MAX_FAILURE_ATTEMPTS if result.invalid else None)
         bar.set_postfix(downloaded=counts["downloaded"],
                         duplicate=counts["duplicate"],
                         failed=counts["failed"])
@@ -191,6 +213,7 @@ def run(cfg: RunConfig) -> dict:
             stats["found"] += len(recs)
             for r in recs:
                 r.tag = tag
+                r.work_key = work_key(r.doi, r.title)
                 if r.url not in seen_urls:
                     seen_urls.add(r.url)
                     fresh.append(r)
@@ -215,6 +238,29 @@ def run(cfg: RunConfig) -> dict:
         futures = [pool.submit(produce, tag, name) for tag, name in jobs]
         concurrent.futures.wait(futures)  # exceptions handled inside produce
 
+    # All searches done: redistribute whatever was deferred for fairness —
+    # shares of sources with few results flow to sources that still have
+    # candidates, so the full download budget is always used.
+    with lock:
+        search_phase["on"] = False
+        deferred = []
+        queues = [q for q in overflow.values() if q]
+        while queues:
+            remaining = []
+            for q in queues:
+                deferred.append(q.pop(0))
+                if q:
+                    remaining.append(q)
+            queues = remaining
+    if deferred:
+        log.info("Redistributing %d deferred record(s) to unused budget shares",
+                 len(deferred))
+        for rec in deferred:
+            record_q.put(rec)
+        with bar.get_lock():
+            bar.total += len(deferred)
+            bar.refresh()
+
     for _ in workers:  # all searches done: tell workers to drain and exit
         record_q.put(_STOP)
     for w in workers:
@@ -233,9 +279,12 @@ def run(cfg: RunConfig) -> dict:
         "found": stats["found"],
         "unique_urls": stats["enqueued"],
         "already_tracked": stats["already_tracked"],
+        "work_duplicates": stats["work_duplicates"],
         "skipped_permanently_failed": stats["blocked"],
         "attempted": stats["attempted"],
         "not_attempted": stats["not_attempted"],
+        "deferred_for_fairness": stats["deferred_for_fairness"],
+        "budget_share_per_source": share,
         "downloaded": counts["downloaded"],
         "duplicates": counts["duplicate"],
         "failed": counts["failed"],
@@ -268,12 +317,14 @@ def _print_report(summary: dict, report_path):
     p(f" Tags searched      : {', '.join(summary['tags'])}")
     p(f" Media / sources    : {summary['media']} / {', '.join(summary['sources'])}")
     p(f" Parallelism        : search x{len(summary['sources']) * max(len(summary['tags']), 1)}"
-      f" threads, downloads x{summary['workers']} workers")
+      f" threads, downloads x{summary['workers']} workers"
+      f" (budget share {summary['budget_share_per_source']}/source)")
     p(f" Records found      : {summary['found']}  (unique URLs: {summary['unique_urls']})")
     p(f" Already tracked    : {summary['already_tracked']} (downloaded in earlier runs)")
     p("-" * 64)
     p(f" DOWNLOADED         : {summary['downloaded']}")
-    p(f" DUPLICATES skipped : {summary['duplicates']} (same SHA-256 already saved)")
+    p(f" DUPLICATES skipped : {summary['duplicates']} (same SHA-256 already saved)"
+      f" + {summary['work_duplicates']} (same paper/book, other copy)")
     p(f" FAILED             : {summary['failed']}")
     if summary.get("not_attempted"):
         p(f" Not attempted      : {summary['not_attempted']} (download budget reached)")

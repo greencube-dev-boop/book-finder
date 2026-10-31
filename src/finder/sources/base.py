@@ -17,6 +17,8 @@ class Record:
     url: str      # direct download URL
     ext: str = "pdf"
     tag: str = field(default="")  # which search tag produced this record
+    doi: str = field(default="")  # DOI when the source provides one
+    work_key: str = field(default="")  # filled by the pipeline (dedup key)
 
 
 class Source:

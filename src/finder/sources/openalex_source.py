@@ -4,7 +4,7 @@ from .. import config as C
 from .base import Record, Source
 
 API = "https://api.openalex.org/works"
-SELECT = "id,display_name,best_oa_location,primary_location"
+SELECT = "id,display_name,doi,best_oa_location,primary_location"
 MAX_PAGES = 5
 
 
@@ -39,7 +39,7 @@ class OpenAlexSource(Source):
                     continue
                 records.append(Record(
                     source=self.name, media=self.media, id=oa_id, title=title,
-                    url=pdf, ext="pdf",
+                    url=pdf, ext="pdf", doi=work.get("doi") or "",
                 ))
                 if len(records) >= limit:
                     break

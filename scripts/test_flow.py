@@ -34,7 +34,7 @@ def check(name, cond):
 # ---------------- Part A: tracker array semantics ----------------
 tmp = Path(tempfile.mkdtemp(prefix="bf_track_test_"))
 t = DownloadTracker(tmp / "t.db")
-check("A1 load_cache on empty db", t.load_cache() == (0, 0, 0))
+check("A1 load_cache on empty db", t.load_cache() == (0, 0, 0, 0))
 check("A2 unknown sha -> not known", t.knows_sha("deadbeef") is False)
 t.remember_sha("deadbeef")
 check("A3 remember_sha -> known", t.knows_sha("deadbeef") is True)
@@ -50,11 +50,26 @@ ins2 = t.record_file(sha256="deadbeef", url="http://x/u2", filepath="p2.pdf",
 check("A6 same sha again -> not inserted", ins2 is False)
 check("A7 failed url recorded+cached", (t.record_failure(url="http://x/bad",
       source="s", error="boom"), t.failure_attempts("http://x/bad") == 1)[1])
+check("A8 fresh failure not skipped", t.should_skip_failure("http://x/bad") is False)
+t.record_failure(url="http://x/bad2", source="s", error="boom2", bump_to=3)
+check("A9 bump_to=3 -> attempts maxed", t.failure_attempts("http://x/bad2") == 3)
+check("A10 recent max-failure IS skipped", t.should_skip_failure("http://x/bad2") is True)
+t.conn.execute("UPDATE failures SET last_attempt = ? WHERE url = ?",
+               ("2020-01-01T00:00:00+00:00", "http://x/bad2"))
+t.conn.commit()
+if t._failures is not None:
+    t._failures["http://x/bad2"] = (3, "2020-01-01T00:00:00+00:00")
+check("A11 old failure (>30d) retried again", t.should_skip_failure("http://x/bad2") is False)
 
-t.forget("deadbeef", "http://x/u1")
-check("A8 forget -> sha unknown again", t.knows_sha("deadbeef") is False)
-check("A9 forget -> url unknown again", t.knows_url("http://x/u1") is False)
-check("A10 db row really deleted", t.has_sha_db("deadbeef") is False)
+t.record_work("doi:10.1234/x", "deadbeef")
+check("A12 work key recorded", t.knows_work("doi:10.1234/x") is True)
+check("A13 second work insert ignored", t.record_work("doi:10.1234/x", "other") is False)
+
+t.forget("deadbeef", "http://x/u1", "doi:10.1234/x")
+check("A14 forget -> sha unknown again", t.knows_sha("deadbeef") is False)
+check("A15 forget -> url unknown again", t.knows_url("http://x/u1") is False)
+check("A16 forget -> work unknown again", t.knows_work("doi:10.1234/x") is False)
+check("A17 db row really deleted", t.has_sha_db("deadbeef") is False)
 t.close()
 shutil.rmtree(tmp, ignore_errors=True)
 

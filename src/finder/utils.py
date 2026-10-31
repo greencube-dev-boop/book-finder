@@ -78,3 +78,24 @@ def is_arxiv_category(tag: str) -> bool:
     if "." in t:
         return t.split(".", 1)[0] in _ARXIV_PREFIXES
     return t in _ARXIV_PLAIN
+
+
+_DOI_URL = re.compile(r"^https?://(dx\.)?doi\.org/", re.IGNORECASE)
+
+
+def normalize_doi(doi) -> str:
+    """'https://doi.org/10.1234/X.Y' -> '10.1234/x.y'."""
+    return _DOI_URL.sub("", str(doi or "").strip()).lower()
+
+
+def work_key(doi, title) -> str:
+    """Work-level identity: DOI when available, else the normalized title.
+
+    Same paper fetched from several sources (different bytes, different URLs)
+    shares one key, so it is downloaded only once. Empty when neither is
+    usable (no dedup possible)."""
+    d = normalize_doi(doi)
+    if d:
+        return "doi:" + d
+    t = re.sub(r"[^a-z0-9]+", "", str(title or "").lower())[:150]
+    return "title:" + t if t else ""

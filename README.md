@@ -25,6 +25,20 @@ the moment a search returns results** — a pool of worker threads (Cell 2's
 still being searched. Per-source politeness delays and API rate limits are
 still respected (thread-safe rate limiter).
 
+### Fair budget + two-layer dedup + validated files
+
+- **Budget split**: `MAX_DOWNLOADS` is divided equally across the selected
+  sources; a source with fewer results donates its share to the others, so the
+  full budget is always used and no source starves.
+- **Work-level dedup**: the same paper from arXiv/OpenAlex/Semantic Scholar
+  (different bytes, different URLs) is downloaded once — keyed by DOI, falling
+  back to normalized title. First copy downloaded wins.
+- **Content validation**: PDFs must parse with >= 1 page (`pypdf`), EPUBs must
+  be intact zips. Invalid files are deleted before reaching `raw/` and their
+  URLs are marked fully failed (corruption is deterministic — no retries).
+- **Self-healing failures**: a URL is skipped only if it failed 3+ times within
+  the last 30 days; older failures get another chance.
+
 ### The download flow (staging + SHA-256 array)
 
 1. The tracker DB is loaded into memory once per run (all hashes, URLs and
